@@ -108,13 +108,63 @@ that predate `registerView`, the plugin falls back to the single-line `ctx.tuiSt
 - **Estimate before usage.** Until the adapter's `usage` chunk lands, tokens are estimated from
   characters (`charsPerToken`), so the live gauge is approximate and settles on completion.
 
-## Development
+## Build from source
+
+The plugin ships as compiled ESM: `lib/` is generated and is **not** committed, so a fresh
+clone has to be built once before dsh-TUI can load it.
+
+**Requirements:** Node `^22.19 || >=24` and npm.
 
 ```bash
+git clone <this repo> dsh-throughput
+cd dsh-throughput
+
+# 1. Install dependencies (including TypeScript and the DSH type packages).
 npm install --include=dev
-npm run build      # tsc → lib/types
-npm test           # node --test
+
+# 2. Compile src/ → lib/types/.
+npm run build
+
+# 3. Optional: typecheck only / run the tests.
+npm run typecheck
+npm test
 ```
+
+`npm install --include=dev` matters when `NODE_ENV=production` is set in your shell, because
+npm then omits devDependencies by default and `tsc` will be missing.
+
+The build writes:
+
+```
+lib/types/index.js   plugin entry (name / Config / apply)
+lib/types/store.js   throughput registry and stats
+lib/types/view.js    status-view component and formatting
+lib/types/*.d.ts     type declarations
+```
+
+`npm run build` runs `tsc -p tsconfig.json`; it emits declarations, so keep the source
+TypeScript-clean rather than relying on `skipLibCheck` to hide errors in this package.
+
+### Rebuilding after a change
+
+```bash
+npm run build
+```
+
+If the package was installed into a profile with `dsh plugin add` (a live link), the next
+dsh-TUI start loads the rebuilt `lib/`. Restart dsh-TUI — a running session keeps the module
+it already imported.
+
+### Installing the build
+
+```bash
+dsh plugin --profile dsh-tui add /path/to/dsh-throughput
+```
+
+`dsh plugin add` links the package and appends it to `dsh.profile.bundles`; the bundle patch
+mounts the `throughput` row on the next start. See [Install](#install) above.
+
+### Plugin contract
 
 The plugin follows the dsh-TUI runtime-plugin contract: `name` / `Config` (type) / `Config`
 (schema) / `apply`, no default export, every config key defaulted, cleanup through

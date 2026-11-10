@@ -117,11 +117,25 @@ function resolve(config: Config): Resolved {
  * @param config - Validated plugin config (schema defaults applied).
  */
 export function apply(ctx: Context, config: Config = {}): void {
-  const status = ctx.get('tuiStatus', false) as TuiStatusLike | undefined
-  // No TUI host composed: stay silent rather than failing boot.
-  if (status === undefined) return
-
   const resolved = resolve(config)
+
+  // `tuiStatus` comes from the host's extension bundle, and bundle rows are
+  // applied before every service they provide is necessarily live. A one-shot
+  // `ctx.get('tuiStatus', false)` therefore races the host: on a cold boot the
+  // row can run first, see nothing, and leave the meter dark for the whole
+  // session (a live patch reload hides this, because the service already
+  // exists by then). `ctx.inject` defers the wiring until the service is
+  // available and re-runs it when the service is replaced.
+  ctx.inject(['tuiStatus'], (scoped) => {
+    const status = scoped.get('tuiStatus', false) as TuiStatusLike | undefined
+    // No TUI host composed: stay silent rather than failing boot.
+    if (status === undefined) return
+    wire(scoped, status, resolved)
+  })
+}
+
+/** Bind the data sources to a live status surface and mount the chosen placement. */
+function wire(ctx: Context, status: TuiStatusLike, resolved: Resolved): void {
   const store = new ThroughputStore(resolved)
 
   // Live stream frames (dsh 0.1.5+). On an older host the event is simply

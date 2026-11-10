@@ -182,8 +182,15 @@ mounts the `throughput` row on the next start. See [Install](#install) above.
 ### Plugin contract
 
 The plugin follows the dsh-TUI runtime-plugin contract: `name` / `Config` (type) / `Config`
-(schema) / `apply`, no default export, every config key defaulted, cleanup through
-`ctx.effect`, and optional seams probed with `ctx.get(..., false)`.
+(schema) / `apply`, no default export, every config key defaulted, and cleanup through
+`ctx.effect`.
+
+The optional `tuiStatus` seam is awaited with `ctx.inject(['tuiStatus'], ...)` rather than
+probed once with `ctx.get`. Bundle rows are applied before the host's own extension bundle is
+guaranteed to have registered that service, so a point-in-time lookup races the host: on a cold
+boot the row can run first, see nothing, and stay dormant for the whole session. Injecting
+defers the wiring until the service exists and re-runs it if the service is replaced, while
+`scoped.get('tuiStatus', false)` still covers the no-host case silently.
 
 ## License
 

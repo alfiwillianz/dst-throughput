@@ -7,8 +7,10 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 function fakeContext(status) {
   const handlers = new Map()
   const cleanups = []
+  const waiting = []
+  let current = status
   const ctx = {
-    get: () => status,
+    get: () => current,
     on: (event, handler) => {
       handlers.set(event, handler)
     },
@@ -16,8 +18,19 @@ function fakeContext(status) {
       const cleanup = factory()
       if (typeof cleanup === 'function') cleanups.push(cleanup)
     },
+    // Mirrors Cordis: run now when the service is already available, otherwise
+    // stay parked until it is provided (and re-run on every replacement).
+    inject: (_deps, callback) => {
+      if (current === undefined) waiting.push(callback)
+      else callback(ctx)
+    },
   }
-  return { ctx, handlers, cleanups }
+  // Publish a status service to callbacks parked in `inject`.
+  const provide = (value) => {
+    current = value
+    for (const callback of waiting.splice(0)) callback(ctx)
+  }
+  return { ctx, handlers, cleanups, provide }
 }
 
 function stream(handlers, agent, frame) {
@@ -141,6 +154,48 @@ test('stays a no-op without any TUI status service', () => {
   assert.doesNotThrow(() => apply(ctx, {}))
   assert.equal(handlers.size, 0)
   assert.equal(cleanups.length, 0)
+})
+
+test('wires the meter when tuiStatus appears after apply', async () => {
+  // A cold boot composes this row before the host's extension bundle registers
+  // `tuiStatus`; a one-shot probe would leave the footer dark for the session.
+  const calls = []
+  const { ctx, handlers, cleanups, provide } = fakeContext(undefined)
+  apply(ctx, {})
+  assert.equal(handlers.size, 0)
+
+  provide({
+    setField: (key, text, options) => {
+      calls.push({ key, text, options })
+      return () => {}
+    },
+  })
+  assert.equal(typeof handlers.get('agent/assistant-stream'), 'function')
+
+  startStreaming(handlers, { id: 'a1', options: {}, session: {} })
+  try {
+    await delay(300)
+    assert.match(calls.at(-1).text, /^\d+ tps$/)
+  } finally {
+    for (const cleanup of cleanups) cleanup()
+  }
+  assert.equal(calls.at(-1).text, undefined)
+})
+
+test('panel mode registers once the late tuiStatus arrives', () => {
+  const registered = []
+  const { ctx, provide } = fakeContext(undefined)
+  apply(ctx, { placement: 'panel' })
+  assert.equal(registered.length, 0)
+
+  provide({
+    registerView: (descriptor) => {
+      registered.push(descriptor)
+      return () => {}
+    },
+  })
+  assert.equal(registered.length, 1)
+  assert.equal(registered[0].key, 'throughput')
 })
 
 test('fed events never throw through the plugin surface', () => {

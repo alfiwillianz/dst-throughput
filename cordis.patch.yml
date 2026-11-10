@@ -1,0 +1,13 @@
+# Bundle patch for dsh-throughput: mount the plugin as a profile row.
+#
+# `dsh plugin --profile dsh-tui add ./` (or `/plugin install`) installs the
+# package into the profile and appends it to `dsh.profile.bundles`, because
+# this package.json declares `dsh.bundle.patch`. At boot, app-boot applies the
+# patch over the root composition and the row below is what actually mounts
+# the meter.
+#
+# To tune a value, override this row's config by id in the profile's own
+# `cordis.patch.yml` user layer — do NOT insert a second same-id row.
+- insert:
+    - id: throughput
+      name: 'dsh-throughput'

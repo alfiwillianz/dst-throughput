@@ -1,18 +1,17 @@
 /**
  * dsh-throughput — a live tokens/second meter for dsh-TUI.
  *
- * One header line plus one row per active participant (main agent and
- * subagents), rendered above the prompt through seam XI
- * (`ctx.tuiStatus.registerView`, up to three rows). Hosts that do not expose
- * the rich view fall back to the single-line `ctx.tuiStatus.set` seam.
+ * Two placements, chosen by config:
  *
- * Data sources, both optional and probed structurally:
- * - `agent/assistant-stream` transient frames — live deltas and usage;
- * - `session/event` — durable `step/start`, `assistant/message` (exact usage),
- *   `tool/call`, `tool/result`;
- * - `agent/status` — participant lifecycle.
+ * - `footer` (default): one cell in the prompt footer, beside the model / cache
+ *   / workspace line, through `ctx.tuiStatus.setField`.
+ * - `panel`: one compact line above the prompt, through
+ *   `ctx.tuiStatus.registerView`.
  *
- * Nothing is written to disk and nothing is appended to the session log.
+ * Both show a single session total — there are no per-agent rows. Data comes
+ * from `agent/assistant-stream` frames (live) and the durable `session/event`
+ * stream (exact usage), with `agent/status` for lifecycle. Nothing is written
+ * to disk and nothing is appended to the session log.
  *
  * @module dsh-throughput
  */
@@ -23,45 +22,58 @@ import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-session'
 // Type-only: resolves the `agent/status` declaration.
 import type {} from '@deepseek-ai/dsh-agent'
-import { ThroughputStore, type ThroughputOptions } from './store.js'
+import { ThroughputStore, fieldDetail, fieldText, type ThroughputOptions } from './store.js'
 import { createThroughputView } from './view.js'
 
 export const name = 'throughput'
 
+/** Where the meter renders. */
+export type Placement = 'footer' | 'panel'
+
+/** Footer slot: end of the left group, or head/tail of the right group. */
+export type FieldSlot = 'left-tail' | 'right-head' | 'right-tail'
+
 /** Configurable knobs; every key has a default so a missing config is a no-op. */
 export type Config = {
-  /** Rows the panel may occupy (1 = header only, 3 = header + two rows). */
-  maxRows?: number
-  /** Live-gauge refresh interval in ms while something is streaming. */
+  /** `footer` = one cell in the prompt footer; `panel` = one line above it.
+   *  Accepted as a string and normalized in `resolve`; anything else is `footer`. */
+  placement?: string
+  /** Render tick in ms. */
   tickMs?: number
-  /** Completed-response samples retained for the sparkline / μ / p95. */
+  /** Completed-response samples retained for μ / p95. */
   historySize?: number
   /** Fallback characters-per-token estimate when the adapter reports no usage. */
   charsPerToken?: number
-  /** How long a finished row stays visible, in ms. */
-  idleHideMs?: number
-  /** Show subagent rows (false keeps the main agent only). */
-  showSubagents?: boolean
-  /** Hide the panel entirely while nothing is streaming. */
-  hideWhenIdle?: boolean
-  /** Use `tuiStatus.set` when the host has no `registerView`. */
+  /** Footer only: where the cell joins the footer; anything else is `left-tail`. */
+  slot?: string
+  /** Footer only: cell width cap in terminal cells (host clamps 1…32). */
+  maxCells?: number
+  /** Footer only: provide the hover detail line. */
+  detail?: boolean
+  /** Use `tuiStatus.set` when the chosen rich surface is unavailable. */
   statusLineFallback?: boolean
 }
 
 export const Config: Schemastery<Config> = z.object({
-  maxRows: z.number().default(3),
+  placement: z.string().default('footer'),
   tickMs: z.number().default(200),
   historySize: z.number().default(12),
   charsPerToken: z.number().default(4),
-  idleHideMs: z.number().default(3000),
-  showSubagents: z.boolean().default(true),
-  hideWhenIdle: z.boolean().default(true),
+  slot: z.string().default('left-tail'),
+  maxCells: z.number().default(12),
+  detail: z.boolean().default(true),
   statusLineFallback: z.boolean().default(true),
 })
 
 /** Structural view of seam XI; the real type lives in the host. */
 interface TuiStatusLike {
   set?(key: string, text: string | undefined): unknown
+  setField?(key: string, text: string | undefined, options?: {
+    slot?: FieldSlot
+    tone?: 'dim' | 'accent' | 'success' | 'warning' | 'error'
+    maxCells?: number
+    detail?: string
+  }): unknown
   registerView?(descriptor: {
     key: string
     maxRows?: 1 | 2 | 3
@@ -69,20 +81,32 @@ interface TuiStatusLike {
   }): (() => void) | undefined
 }
 
+interface Resolved extends ThroughputOptions {
+  placement: Placement
+  tickMs: number
+  slot: FieldSlot
+  maxCells: number
+  detail: boolean
+  statusLineFallback: boolean
+}
+
+const SLOTS: readonly FieldSlot[] = ['left-tail', 'right-head', 'right-tail']
+
 function clamp(value: number | undefined, fallback: number, min: number, max: number): number {
   if (value === undefined || !Number.isFinite(value)) return fallback
   return Math.min(max, Math.max(min, value))
 }
 
-function resolve(config: Config): ThroughputOptions & { hideWhenIdle: boolean; statusLineFallback: boolean } {
+function resolve(config: Config): Resolved {
+  const slot = SLOTS.includes(config.slot as FieldSlot) ? (config.slot as FieldSlot) : 'left-tail'
   return {
-    maxRows: Math.round(clamp(config.maxRows, 3, 1, 3)),
+    placement: config.placement === 'panel' ? 'panel' : 'footer',
     tickMs: Math.round(clamp(config.tickMs, 200, 100, 2000)),
     historySize: Math.round(clamp(config.historySize, 12, 1, 64)),
     charsPerToken: clamp(config.charsPerToken, 4, 1, 16),
-    idleHideMs: Math.round(clamp(config.idleHideMs, 3000, 0, 60_000)),
-    showSubagents: config.showSubagents ?? true,
-    hideWhenIdle: config.hideWhenIdle ?? true,
+    slot,
+    maxCells: Math.round(clamp(config.maxCells, 12, 1, 32)),
+    detail: config.detail ?? true,
     statusLineFallback: config.statusLineFallback ?? true,
   }
 }
@@ -120,29 +144,73 @@ export function apply(ctx: Context, config: Config = {}): void {
     store.onSessionDisposed(session)
   })
 
-  const component = createThroughputView(store, {
-    tickMs: resolved.tickMs,
-    hideWhenIdle: resolved.hideWhenIdle,
-  })
+  if (resolved.placement === 'panel') mountPanel(ctx, status, store, resolved)
+  else mountFooter(ctx, status, store, resolved)
+}
 
-  const disposeView = status.registerView?.({
-    key: 'throughput',
-    maxRows: resolved.maxRows as 1 | 2 | 3,
-    component,
-  })
+/** Footer placement: one keyed text cell, updated only when the text changes. */
+function mountFooter(ctx: Context, status: TuiStatusLike, store: ThroughputStore, resolved: Resolved): void {
+  let lastText: string | undefined
+  let useField = typeof status.setField === 'function'
 
-  if (disposeView !== undefined) {
-    ctx.effect(() => () => disposeView(), 'throughput status view')
+  const render = (): void => {
+    const snapshot = store.getSnapshot()
+    const text = fieldText(snapshot)
+    if (text === lastText) return
+    lastText = text
+    const detail = resolved.detail ? fieldDetail(snapshot) ?? 'session throughput' : undefined
+    try {
+      if (useField) {
+        const result = status.setField?.('throughput', text, {
+          slot: resolved.slot,
+          tone: snapshot.streaming > 0 ? 'accent' : 'dim',
+          maxCells: resolved.maxCells,
+          ...(detail === undefined ? {} : { detail }),
+        })
+        // A refusal (undefined) falls back to the scalar line; a clear is
+        // already the terminal state.
+        if (result !== undefined || text === undefined) return
+        useField = false
+      }
+      if (resolved.statusLineFallback && status.set !== undefined) status.set('throughput', text)
+    } catch {
+      // A refused or closed surface must never break the session.
+    }
+  }
+
+  render()
+  const timer = setInterval(render, resolved.tickMs)
+  ctx.effect(() => () => {
+    clearInterval(timer)
+    try {
+      if (useField) status.setField?.('throughput', undefined)
+      else status.set?.('throughput', undefined)
+    } catch {
+      // Already gone.
+    }
+  }, 'throughput footer field')
+}
+
+/** Panel placement: one rich line above the prompt, with a scalar fallback. */
+function mountPanel(ctx: Context, status: TuiStatusLike, store: ThroughputStore, resolved: Resolved): void {
+  const component = createThroughputView(store, { tickMs: resolved.tickMs })
+  const dispose = status.registerView?.({ key: 'throughput', maxRows: 1, component })
+  if (dispose !== undefined) {
+    ctx.effect(() => () => dispose(), 'throughput panel')
     return
   }
 
   if (!resolved.statusLineFallback || status.set === undefined) return
-  const set = status.set.bind(status)
+  let lastText: string | undefined
   const render = (): void => {
+    const snapshot = store.getSnapshot()
+    const text = fieldText(snapshot)
+    if (text === lastText) return
+    lastText = text
     try {
-      set('throughput', store.statusLine())
+      status.set?.('throughput', text)
     } catch {
-      // A refused/closed status line must not break the session.
+      // Already gone.
     }
   }
   render()
@@ -150,7 +218,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.effect(() => () => {
     clearInterval(timer)
     try {
-      set('throughput', undefined)
+      status.set?.('throughput', undefined)
     } catch {
       // Already gone.
     }

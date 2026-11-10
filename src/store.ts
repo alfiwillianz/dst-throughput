@@ -1,7 +1,7 @@
 /**
  * In-memory throughput registry for dsh-TUI.
  *
- * Folds the two live sources the host exposes:
+ * Folds the two live sources the host exposes into one session-level total:
  *
  * - `agent/assistant-stream` transient frames (dsh 0.1.5+): `start` / `chunk` /
  *   `end`, where `chunk.chunk` is a `StreamChunk` (`text-delta`,
@@ -11,46 +11,37 @@
  *   `usage.outputTokens`, so it corrects the frame estimate and is the only
  *   source on hosts that no longer publish live chunks.
  *
+ * Per-agent attempts are tracked internally so concurrent agents sum into one
+ * total, but the snapshot exposes aggregates only: both render surfaces (footer
+ * cell and one-line panel) show a single total, never per-agent rows.
+ *
  * Nothing is persisted: the registry lives in process memory and is dropped
  * with the plugin fiber.
  *
  * @module dsh-throughput/store
  */
 
-/** Phases a participant can be in, mirroring the row icon vocabulary. */
-export type ThroughputPhase = 'streaming' | 'tool' | 'waiting' | 'done'
+/** Phases a participant can be in. */
+type Phase = 'streaming' | 'tool' | 'waiting' | 'done'
 
-/** One rendered participant row. */
-export interface ThroughputRow {
-  readonly id: string
-  readonly label: string
-  readonly model?: string
-  readonly phase: ThroughputPhase
-  /** Live tokens/second for this row (0 when nothing is streaming). */
-  readonly tps: number
-  /** Tokens attributed to the current/last response. */
-  readonly tokens: number
-}
-
-/** Immutable render snapshot handed to the status view. */
+/** Immutable render snapshot handed to the render surfaces. */
 export interface ThroughputSnapshot {
-  readonly rows: readonly ThroughputRow[]
-  /** Rows that did not fit the panel but are still active. */
-  readonly hidden: number
+  /** Sum of the live per-agent rates; 0 when nothing is streaming. */
+  readonly liveTps: number
   /** TPS of the last completed response. */
   readonly last?: number
   /** Mean over the retained history. */
   readonly mean?: number
   /** p95 over the retained history. */
   readonly p95?: number
-  /** Participants that are not finished. */
-  readonly active: number
-  /** Participants currently receiving model output. */
+  /** Agents currently receiving model output. */
   readonly streaming: number
-  /** Sum of the live per-row TPS. */
-  readonly totalTps: number
-  /** Sum of the tokens attributed to every participant. */
+  /** Agents that are not finished. */
+  readonly active: number
+  /** Tokens attributed to every response seen in this session. */
   readonly totalTokens: number
+  /** Completed responses retained in the history ring. */
+  readonly responses: number
   /** Recent completed-response TPS samples, oldest first. */
   readonly spark: readonly number[]
   /** True when there is nothing to show. */
@@ -59,12 +50,8 @@ export interface ThroughputSnapshot {
 
 /** Resolved plugin knobs (schema defaults already applied). */
 export interface ThroughputOptions {
-  readonly maxRows: number
-  readonly tickMs: number
   readonly historySize: number
   readonly charsPerToken: number
-  readonly idleHideMs: number
-  readonly showSubagents: boolean
 }
 
 interface Attempt {
@@ -80,24 +67,23 @@ interface Attempt {
 
 interface Participant {
   readonly id: string
-  label: string
-  model?: string
-  phase: ThroughputPhase
+  phase: Phase
   attempt?: Attempt
+  /** Tokens of the current/last response. */
   tokens: number
+  /** Tokens accumulated over the whole session for this agent. */
+  totalTokens: number
   tps: number
-  doneAt?: number
   /** `${turn}:${step}` of the response already folded into the history ring. */
   sampleKey?: string
 }
 
 const EMPTY: ThroughputSnapshot = {
-  rows: [],
-  hidden: 0,
-  active: 0,
+  liveTps: 0,
   streaming: 0,
-  totalTps: 0,
+  active: 0,
   totalTokens: 0,
+  responses: 0,
   spark: [],
   idle: true,
 }
@@ -143,8 +129,8 @@ function asString(value: unknown): string | undefined {
 /**
  * The live throughput registry.
  *
- * Callers feed host events into the `on*` methods; the status view subscribes
- * through {@link subscribe} and reads {@link getSnapshot}.
+ * Callers feed host events into the `on*` methods; the render surfaces poll
+ * {@link getSnapshot} on their own tick and subscribe through {@link subscribe}.
  */
 export class ThroughputStore {
   private readonly participants = new Map<string, Participant>()
@@ -156,7 +142,8 @@ export class ThroughputStore {
   private readonly durableSamples = new WeakMap<object, Set<string>>()
   /** Session object → step start timestamp (`step/start`). */
   private readonly stepStarts = new WeakMap<object, number>()
-  private mainId: string | undefined
+  /** Tokens from durable usage that cannot be attributed to a known agent. */
+  private orphanTokens = 0
   private dirty = true
   private snapshot: ThroughputSnapshot = EMPTY
 
@@ -179,7 +166,7 @@ export class ThroughputStore {
     return this.snapshot
   }
 
-  /** Recompute live rates and notify subscribers (called by the view tick). */
+  /** Recompute live rates and notify subscribers (called by the render tick). */
   refresh(now = Date.now()): void {
     this.snapshot = this.build(now)
     this.dirty = false
@@ -198,7 +185,7 @@ export class ThroughputStore {
     if (record === undefined) return
     const type = asString(record.type)
     const time = asNumber(record.time) ?? at
-    const participant = this.ensure(agentId, agentRecord)
+    const participant = this.ensure(agentId)
 
     if (type === 'start') {
       this.startAttempt(participant, time, record)
@@ -250,25 +237,17 @@ export class ThroughputStore {
     if (agentId === undefined) return
     const session = agentRecord?.session
     if (typeof session === 'object' && session !== null) this.sessionOwners.set(session, agentId)
-    const participant = this.ensure(agentId, agentRecord)
+    const participant = this.ensure(agentId)
     if (status === 'running') {
-      if (participant.phase === 'done') {
-        participant.phase = 'waiting'
-        participant.doneAt = undefined
-      }
+      if (participant.phase === 'done') participant.phase = 'waiting'
       return
     }
     if (status === 'idle' && participant.phase !== 'done') {
       participant.attempt = undefined
       participant.tps = 0
-      // A turn that produced tokens is finished and should age out; one that
-      // never streamed (startup idle) must not flash a done row.
-      if (participant.tokens > 0) {
-        participant.phase = 'done'
-        participant.doneAt = at
-      } else {
-        participant.phase = 'waiting'
-      }
+      // A turn that produced tokens is finished; one that never streamed
+      // (startup idle) must not be reported as a completed response.
+      participant.phase = participant.tokens > 0 ? 'done' : 'waiting'
       this.markDirty()
     }
   }
@@ -282,34 +261,10 @@ export class ThroughputStore {
     this.markDirty()
   }
 
-  /** Single-line fallback for hosts without `tuiStatus.registerView`. */
-  statusLine(): string {
-    const snapshot = this.getSnapshot()
-    if (snapshot.idle) return 'Throughput · idle'
-    const parts: string[] = []
-    if (snapshot.last !== undefined) parts.push(`${Math.round(snapshot.last)} tps`)
-    if (snapshot.mean !== undefined) parts.push(`μ ${Math.round(snapshot.mean)}`)
-    if (snapshot.p95 !== undefined) parts.push(`p95 ${Math.round(snapshot.p95)}`)
-    if (snapshot.active > 0) parts.push(`${snapshot.active} active`)
-    if (snapshot.totalTokens > 0) parts.push(`${formatTokens(snapshot.totalTokens)} tok`)
-    return parts.length === 0 ? 'Throughput · idle' : `Throughput · ${parts.join(' · ')}`
-  }
-
-  private ensure(id: string, agent: Record<string, unknown> | undefined): Participant {
+  private ensure(id: string): Participant {
     let participant = this.participants.get(id)
     if (participant !== undefined) return participant
-    if (this.mainId === undefined) this.mainId = id
-    const options = asRecord(agent?.options)
-    const provider = asString(options?.provider)
-    const model = asString(options?.model)
-    participant = {
-      id,
-      label: id === this.mainId ? 'main' : `sub-${id.slice(-4)}`,
-      ...(model === undefined ? {} : { model: provider === undefined ? model : `${provider}/${model}` }),
-      phase: 'waiting',
-      tokens: 0,
-      tps: 0,
-    }
+    participant = { id, phase: 'waiting', tokens: 0, totalTokens: 0, tps: 0 }
     this.participants.set(id, participant)
     this.markDirty()
     return participant
@@ -325,7 +280,6 @@ export class ThroughputStore {
       ...(asNumber(frame.step) === undefined ? {} : { step: asNumber(frame.step) }),
     }
     participant.phase = 'streaming'
-    participant.doneAt = undefined
     this.markDirty()
   }
 
@@ -370,9 +324,9 @@ export class ThroughputStore {
     const elapsed = at - (attempt.firstTokenAt ?? attempt.startedAt)
     const tps = safeTps(tokens, elapsed)
     participant.tokens = tokens
+    participant.totalTokens += tokens
     participant.tps = tps
     participant.phase = 'done'
-    participant.doneAt = at
     const key = attempt.turn === undefined || attempt.step === undefined
       ? undefined
       : `${attempt.turn}:${attempt.step}`
@@ -403,7 +357,9 @@ export class ThroughputStore {
       // Frames already folded this response: correct the token count without
       // pushing a second history sample.
       if (key !== undefined && participant.sampleKey === key) {
+        const delta = output - participant.tokens
         participant.tokens = output
+        participant.totalTokens += delta
         this.markDirty()
         return
       }
@@ -419,18 +375,17 @@ export class ThroughputStore {
     const startedAt = typeof session === 'object' && session !== null ? this.stepStarts.get(session) : undefined
     const tps = startedAt === undefined ? 0 : safeTps(output, at - startedAt)
     if (tps > 0) this.pushSample(tps)
+    if (participant === undefined) this.orphanTokens += output
     if (participant !== undefined) {
       participant.tokens = output
+      participant.totalTokens += output
       participant.tps = tps
-      if (participant.phase !== 'done') {
-        participant.phase = 'done'
-        participant.doneAt = at
-      }
+      if (participant.phase !== 'done') participant.phase = 'done'
       this.markDirty()
     }
   }
 
-  private phaseForSession(session: unknown, phase: ThroughputPhase): void {
+  private phaseForSession(session: unknown, phase: Phase): void {
     if (typeof session !== 'object' || session === null) return
     const agentId = this.sessionOwners.get(session)
     if (agentId === undefined) return
@@ -462,53 +417,36 @@ export class ThroughputStore {
   }
 
   private build(now: number): ThroughputSnapshot {
-    for (const [id, participant] of this.participants) {
-      if (participant.phase === 'done' && participant.doneAt !== undefined && now - participant.doneAt > this.options.idleHideMs) {
-        this.participants.delete(id)
+    let liveTps = 0
+    let streaming = 0
+    let active = 0
+    let totalTokens = 0
+    for (const participant of this.participants.values()) {
+      totalTokens += participant.totalTokens
+      if (participant.phase !== 'done') active += 1
+      if (participant.phase === 'streaming') {
+        streaming += 1
+        liveTps += this.liveTps(participant, now)
       }
     }
 
-    const rows: ThroughputRow[] = []
-    for (const participant of this.participants.values()) {
-      const live = participant.phase === 'done' ? participant.tps : this.liveTps(participant, now)
-      rows.push({
-        id: participant.id,
-        label: participant.label,
-        ...(participant.model === undefined ? {} : { model: participant.model }),
-        phase: participant.phase,
-        tps: live,
-        tokens: participant.tokens,
-      })
-    }
-    rows.sort((a, b) => b.tps - a.tps || a.label.localeCompare(b.label))
-
-    const visible = this.options.showSubagents
-      ? rows.slice(0, Math.max(0, this.options.maxRows - 1))
-      : rows.filter(row => row.label === 'main').slice(0, 1)
-
-    const active = rows.filter(row => row.phase !== 'done').length
-    const streaming = rows.filter(row => row.phase === 'streaming').length
-    const totalTps = rows.reduce((sum, row) => sum + row.tps, 0)
-    const totalTokens = rows.reduce((sum, row) => sum + row.tokens, 0)
+    totalTokens += this.orphanTokens
     const spark = [...this.ring]
     const last = spark.length === 0 ? undefined : spark[spark.length - 1]
-
     const average = mean(spark)
     const tail = p95(spark)
-    const snapshot: ThroughputSnapshot = {
-      rows: visible,
-      hidden: Math.max(0, rows.length - visible.length),
+    return {
+      liveTps,
       ...(last === undefined ? {} : { last }),
       ...(average === undefined ? {} : { mean: average }),
       ...(tail === undefined ? {} : { p95: tail }),
-      active,
       streaming,
-      totalTps,
+      active,
       totalTokens,
+      responses: spark.length,
       spark,
-      idle: rows.length === 0,
+      idle: streaming === 0 && active === 0 && spark.length === 0,
     }
-    return snapshot
   }
 
   private liveTps(participant: Participant, now: number): number {
@@ -527,4 +465,25 @@ export function formatTokens(tokens: number): string {
   if (tokens < 1000) return String(Math.round(tokens))
   if (tokens < 1_000_000) return `${(tokens / 1000).toFixed(1)}k`
   return `${(tokens / 1_000_000).toFixed(1)}m`
+}
+
+/**
+ * Footer cell text: the live total while streaming, otherwise the last
+ * completed response. `undefined` clears the field.
+ */
+export function fieldText(snapshot: ThroughputSnapshot): string | undefined {
+  if (snapshot.streaming > 0) return `${Math.round(snapshot.liveTps)} tps`
+  if (snapshot.last !== undefined) return `${Math.round(snapshot.last)} tps`
+  return undefined
+}
+
+/** Hover detail for the footer cell. */
+export function fieldDetail(snapshot: ThroughputSnapshot): string | undefined {
+  if (snapshot.idle) return undefined
+  const parts: string[] = []
+  if (snapshot.mean !== undefined) parts.push(`μ ${Math.round(snapshot.mean)}`)
+  if (snapshot.p95 !== undefined) parts.push(`p95 ${Math.round(snapshot.p95)}`)
+  if (snapshot.responses > 0) parts.push(`${snapshot.responses} responses`)
+  if (snapshot.totalTokens > 0) parts.push(`${formatTokens(snapshot.totalTokens)} tok`)
+  return parts.length === 0 ? undefined : parts.join(' · ')
 }

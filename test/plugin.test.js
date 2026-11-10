@@ -2,14 +2,13 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { apply, Config, name } from '../lib/types/index.js'
 
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
 function fakeContext(status) {
   const handlers = new Map()
   const cleanups = []
   const ctx = {
-    get: (service, strict) => {
-      if (service === 'tuiStatus') return status
-      return strict ? undefined : undefined
-    },
+    get: () => status,
     on: (event, handler) => {
       handlers.set(event, handler)
     },
@@ -21,13 +20,70 @@ function fakeContext(status) {
   return { ctx, handlers, cleanups }
 }
 
+function stream(handlers, agent, frame) {
+  handlers.get('agent/assistant-stream')({ agent, frame })
+}
+
+function startStreaming(handlers, agent) {
+  const t = Date.now()
+  stream(handlers, agent, { type: 'start', time: t, turn: 1, step: 1 })
+  stream(handlers, agent, { type: 'chunk', time: t + 100, chunk: { type: 'text-delta', text: 'x'.repeat(40) } })
+}
+
 test('exports the runtime-plugin contract', () => {
   assert.equal(name, 'throughput')
   assert.equal(typeof apply, 'function')
   assert.equal(typeof Config, 'function')
 })
 
-test('registers a rich status view when the host provides one', () => {
+test('footer mode writes a setField cell and clears it on unload', async () => {
+  const calls = []
+  const status = {
+    setField: (key, text, options) => {
+      calls.push({ key, text, options })
+      return () => {}
+    },
+  }
+  const { ctx, handlers, cleanups } = fakeContext(status)
+  apply(ctx, {})
+
+  startStreaming(handlers, { id: 'a1', options: {}, session: {} })
+  try {
+    await delay(300)
+    const last = calls.at(-1)
+    assert.equal(last.key, 'throughput')
+    assert.match(last.text, /^\d+ tps$/)
+    assert.equal(last.options.slot, 'left-tail')
+    assert.equal(last.options.tone, 'accent')
+    assert.equal(last.options.maxCells, 12)
+    assert.equal(last.options.detail, 'session throughput')
+  } finally {
+    for (const cleanup of cleanups) cleanup()
+  }
+  assert.equal(calls.at(-1).text, undefined)
+})
+
+test('footer placement is the default and honours slot/maxCells', async () => {
+  const calls = []
+  const status = {
+    setField: (key, text, options) => {
+      calls.push({ key, text, options })
+      return () => {}
+    },
+  }
+  const { ctx, handlers, cleanups } = fakeContext(status)
+  apply(ctx, { slot: 'right-tail', maxCells: 8 })
+  startStreaming(handlers, { id: 'a1', options: {}, session: {} })
+  try {
+    await delay(300)
+    assert.equal(calls.at(-1).options.slot, 'right-tail')
+    assert.equal(calls.at(-1).options.maxCells, 8)
+  } finally {
+    for (const cleanup of cleanups) cleanup()
+  }
+})
+
+test('panel mode registers a one-row view', () => {
   const registered = []
   const status = {
     registerView: (descriptor) => {
@@ -35,42 +91,49 @@ test('registers a rich status view when the host provides one', () => {
       return () => {}
     },
   }
-  const { ctx, handlers, cleanups } = fakeContext(status)
-  apply(ctx, {})
+  const { ctx } = fakeContext(status)
+  apply(ctx, { placement: 'panel' })
 
   assert.equal(registered.length, 1)
   assert.equal(registered[0].key, 'throughput')
-  assert.equal(registered[0].maxRows, 3)
-  assert.equal(typeof registered[0].component, 'function')
-  assert.ok(handlers.has('agent/assistant-stream'))
-  assert.ok(handlers.has('session/event'))
-  assert.ok(handlers.has('agent/status'))
-  assert.ok(handlers.has('session/disposed'))
-  assert.equal(cleanups.length, 1)
-})
-
-test('honours maxRows and the subagent switch', () => {
-  const registered = []
-  const status = { registerView: (descriptor) => { registered.push(descriptor); return () => {} } }
-  apply(fakeContext(status).ctx, { maxRows: 1, showSubagents: false })
   assert.equal(registered[0].maxRows, 1)
+  assert.equal(typeof registered[0].component, 'function')
 })
 
-test('falls back to the scalar status line without registerView', () => {
+test('falls back to the scalar line when setField is absent', async () => {
   const calls = []
   const status = {
     set: (key, text) => {
       calls.push([key, text])
-      return () => {}
     },
   }
-  const { ctx, cleanups } = fakeContext(status)
+  const { ctx, handlers, cleanups } = fakeContext(status)
   apply(ctx, {})
-  assert.ok(calls.length >= 1)
-  assert.equal(calls[0][0], 'throughput')
-  assert.match(calls[0][1], /^Throughput/)
-  assert.equal(cleanups.length, 1)
-  for (const cleanup of cleanups) cleanup()
+  startStreaming(handlers, { id: 'a1', options: {}, session: {} })
+  try {
+    await delay(300)
+    assert.ok(calls.some(([key, text]) => key === 'throughput' && /\d+ tps/.test(text)))
+  } finally {
+    for (const cleanup of cleanups) cleanup()
+  }
+})
+
+test('panel mode falls back to the scalar line without registerView', async () => {
+  const calls = []
+  const status = {
+    set: (key, text) => {
+      calls.push([key, text])
+    },
+  }
+  const { ctx, handlers, cleanups } = fakeContext(status)
+  apply(ctx, { placement: 'panel' })
+  startStreaming(handlers, { id: 'a1', options: {}, session: {} })
+  try {
+    await delay(300)
+    assert.ok(calls.some(([key, text]) => key === 'throughput' && /\d+ tps/.test(text)))
+  } finally {
+    for (const cleanup of cleanups) cleanup()
+  }
 })
 
 test('stays a no-op without any TUI status service', () => {
@@ -81,8 +144,8 @@ test('stays a no-op without any TUI status service', () => {
 })
 
 test('fed events never throw through the plugin surface', () => {
-  const status = { registerView: () => () => {} }
-  const { ctx, handlers } = fakeContext(status)
+  const status = { setField: () => () => {} }
+  const { ctx, handlers, cleanups } = fakeContext(status)
   apply(ctx, {})
   const agent = { id: 'a1', options: { provider: 'p', model: 'm' }, session: {} }
   const now = Date.now()
@@ -97,4 +160,5 @@ test('fed events never throw through the plugin surface', () => {
     handlers.get('agent/status')({ agent, status: 'idle' })
     handlers.get('session/disposed')(agent.session)
   })
+  for (const cleanup of cleanups) cleanup()
 })

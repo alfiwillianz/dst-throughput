@@ -1,5 +1,8 @@
 # dsh-throughput
 
+> [!WARNING]
+> **Archived.** This repository is no longer maintained. It targeted **DSH (DeepSeek Harness)**, which is no longer in use, so the plugin is kept for historical reference only. No further releases, issues, or pull requests will be handled.
+
 A live **tokens/second** meter for [dsh-TUI](https://github.com/ccch1mneyyy/dsh-TUI) — the
 dsh-TUI counterpart of [omp-throughput](https://github.com/kajeagentspi/omp-throughput).
 
